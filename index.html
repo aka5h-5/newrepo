@@ -1,3 +1,98 @@
 <p>This is a new repo</p>
 
 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
+
+from state import AgentState, DiffAnalysis
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def diff_intelligence(state: AgentState) -> AgentState:
+    try:
+        logger.info("Running Diff Intelligence (OpenAI)...")
+
+        # ✅ Prepare diff
+        diff_text = ""
+
+        for file, data in state.git_diff.items():
+            if data.get("diff"):
+                diff_text += f"""
+File: {file}
+Status: {data.get("status")}
+Diff:
+{data.get("diff")}
+------------------
+"""
+
+        diff_text = diff_text[:4000]
+
+        # ✅ Prompt
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             """You are a senior software engineer and QA expert.
+
+Analyze the Pull Request and return:
+
+Change Summary:
+<summary>
+
+Risk Level:
+<LOW | MEDIUM | HIGH>
+
+Business Impact:
+<impact>
+
+Testing Areas:
+- item1
+- item2
+- item3
+"""
+             ),
+            ("human",
+             """
+PR Title: {title}
+PR Description: {description}
+
+Code Changes:
+{diff}
+"""
+             )
+        ])
+
+        # ✅ OpenAI model
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",   # ✅ fast & cheaper
+            temperature=0,
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+
+        chain = prompt | llm
+
+        response = chain.invoke({
+            "title": state.pr_data.get("title"),
+            "description": state.pr_data.get("description"),
+            "diff": diff_text
+        })
+
+        state.analysis = DiffAnalysis(
+            change_summary=response.content
+        )
+
+        return state
+
+    except Exception as e:
+        logger.error(f"Error in Node 4: {str(e)}")
+
+        state.analysis = DiffAnalysis(
+            change_summary="Analysis failed"
+        )
+
+        # ✅ only if you added field
+        if hasattr(state, "error"):
+            state.error = str(e)
+
+        return state
