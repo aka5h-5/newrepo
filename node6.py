@@ -1,91 +1,145 @@
-from pydantic import BaseModel
-from typing import Dict, List
-
-class AgentState(BaseModel):
-    repo_path: str
-    changed_files: List[str] = []
-
-    dependency_graph: Dict[str, List[str]] = {}
-    impacted_files: List[str] = []
-
-
-import os
-import ast
+import re
 import networkx as nx
-
+from pathlib import PurePosixPath
 from state import AgentState
 
 
-def dependency_analyzer(state: AgentState) -> AgentState:
+# -----------------------------
+# File groups
+# -----------------------------
+CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+STYLE_EXTENSIONS = (".css", ".scss")
+TEST_PREFIXES = ("tests/",)
+CONFIG_FILES = ("tsconfig.json", "package.json", "vite.config.ts", "rsbuild.config.ts", "Dockerfile")
+ASSET_EXTENSIONS = (".png", ".jpg", ".jpeg", ".svg", ".gif")
 
-    repo_path = state.repo_path
+
+# -----------------------------
+# Regex patterns (expanded)
+# -----------------------------
+JS_IMPORT_REGEX = re.compile(
+    r"""import\s+(?:type\s+)?(?:[\s\S]*?)from\s+['"](.+?)['"]""",
+    re.MULTILINE
+)
+
+DYNAMIC_IMPORT_REGEX = re.compile(
+    r"""import\(\s*['"](.+?)['"]\s*\)"""
+)
+
+EXPORT_REGEX = re.compile(
+    r"""export\s+(?:\*|\{[\s\S]*?\})\s+from\s+['"](.+?)['"]"""
+)
+
+CSS_IMPORT_REGEX = re.compile(
+    r"""@import\s+['"](.+?)['"]"""
+)
+
+
+# -----------------------------
+# Path resolution helpers
+# -----------------------------
+def resolve_candidate(base, path):
+    return (base / path).as_posix()
+
+
+def resolve_with_extensions(candidate, all_files):
+    for f in all_files:
+        if f.startswith(candidate):
+            return f
+    return None
+
+
+def resolve_import(current_file, import_path, all_files):
+    base = PurePosixPath(current_file).parent
+
+    # relative imports
+    if import_path.startswith("."):
+        return resolve_with_extensions(resolve_candidate(base, import_path), all_files)
+
+    # alias imports (e.g. @/components/X)
+    if import_path.startswith("@/"):
+        aliased = "src/" + import_path[2:]
+        return resolve_with_extensions(aliased, all_files)
+
+    return None
+
+
+# -----------------------------
+# Node 6 implementation
+# -----------------------------
+def dependency_analyzer(state: AgentState) -> AgentState:
+    """
+    Node 6 — Repository Dependency Analyzer (enhanced)
+
+    Detects:
+    - runtime imports
+    - type-only imports
+    - re-exports
+    - dynamic imports
+    - styles, tests, configs, assets
+    """
 
     graph = nx.DiGraph()
+    all_files = set(state.repository_files)
 
-    python_files = []
+    # add all files as nodes
+    for f in all_files:
+        graph.add_node(f)
 
-    # Collect Python files
-    for root, _, files in os.walk(repo_path):
-        for file in files:
-            if file.endswith(".py"):
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, repo_path)
+    for file, content in state.repository_contents.items():
 
-                python_files.append(rel_path)
-                graph.add_node(rel_path)
+        # -------------------------
+        # JS / TS imports
+        # -------------------------
+        if file.endswith(CODE_EXTENSIONS):
 
-    # Build dependency graph
-    for file in python_files:
+            for regex in (JS_IMPORT_REGEX, EXPORT_REGEX, DYNAMIC_IMPORT_REGEX):
+                for path in regex.findall(content):
+                    resolved = resolve_import(file, path, all_files)
+                    if resolved:
+                        graph.add_edge(file, resolved, type="import")
 
-        full_path = os.path.join(repo_path, file)
+            # config references
+            for cfg in CONFIG_FILES:
+                if cfg in content:
+                    graph.add_edge(file, cfg, type="config")
 
-        try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                tree = ast.parse(f.read())
+            # asset usage
+            for asset in all_files:
+                if asset.endswith(ASSET_EXTENSIONS) and asset in content:
+                    graph.add_edge(file, asset, type="asset")
 
-            for node in ast.walk(tree):
+        # -------------------------
+        # CSS imports
+        # -------------------------
+        if file.endswith(STYLE_EXTENSIONS):
+            for path in CSS_IMPORT_REGEX.findall(content):
+                resolved = resolve_import(file, path, all_files)
+                if resolved:
+                    graph.add_edge(file, resolved, type="style")
 
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
+        # -------------------------
+        # Test dependencies
+        # -------------------------
+        if file.startswith(TEST_PREFIXES):
+            for target in all_files:
+                short = target.replace("src/", "").split(".")[0]
+                if short and short in content:
+                    graph.add_edge(file, target, type="test")
 
-                        imported_module = alias.name.replace(".", "/") + ".py"
-
-                        if imported_module in python_files:
-                            graph.add_edge(file, imported_module)
-
-                elif isinstance(node, ast.ImportFrom):
-
-                    if node.module:
-
-                        imported_module = (
-                            node.module.replace(".", "/") + ".py"
-                        )
-
-                        if imported_module in python_files:
-                            graph.add_edge(file, imported_module)
-
-        except Exception as e:
-            print(f"Error parsing {file}: {e}")
-
-    impacted_files = set()
-
-    # Find impacted files
-    for changed_file in state.changed_files:
-
-        if changed_file in graph:
-
-            impacted_files.add(changed_file)
-
-            # Files that depend on changed file
-            predecessors = nx.ancestors(graph, changed_file)
-
-            impacted_files.update(predecessors)
-
+    # -------------------------
+    # Serialize
+    # -------------------------
     state.dependency_graph = {
-        node: list(graph.successors(node))
-        for node in graph.nodes()
+        "nodes": list(graph.nodes),
+        "edges": [
+            {
+                "from": u,
+                "to": v,
+                "type": graph.edges[u, v].get("type", "import")
+            }
+            for u, v in graph.edges
+        ]
     }
-
-    state.impacted_files = list(impacted_files)
 
     return state
